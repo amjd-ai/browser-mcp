@@ -44,13 +44,15 @@ export function startFixtureServer() {
 }
 
 /**
- * Spawn the MCP server. `ENABLE_EVAL_JS` is removed from the inherited
- * environment so the default (disabled) is exercised unless a test passes it
+ * Spawn the MCP server. The opt-in capability gates (`ENABLE_EVAL_JS`,
+ * `ENABLE_WEBGL_SHIM`) are removed from the inherited environment so the
+ * security-relevant default (disabled) is exercised unless a test passes one
  * explicitly via extraEnv.
  */
 export function startMcpServer(extraEnv = {}) {
   const env = { ...process.env };
   delete env.ENABLE_EVAL_JS;
+  delete env.ENABLE_WEBGL_SHIM;
   Object.assign(env, extraEnv);
 
   const proc = spawn('node', ['index.js'], {

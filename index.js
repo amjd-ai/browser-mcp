@@ -10,6 +10,7 @@ import {
   truncateText,
   validateSafePath,
   isEvalJsEnabled,
+  isWebglShimEnabled,
   decodeImageSize,
   ERRORS,
   CONFIG
@@ -26,8 +27,12 @@ import {
   waitForSettle,
   hoverElement,
   pressKey,
-  evaluateExpression
+  evaluateExpression,
+  getBoundingBox,
+  webglInfo,
+  canvasInfo
 } from './src/helpers.js';
+import { TRACE_SUMMARY_EXPRESSION, TRACE_CLEAR_EXPRESSION } from './src/webgl.js';
 import { resolveViewportParams } from './src/viewport.js';
 import { resolveKey } from './src/keymap.js';
 import { writeFile, mkdir } from 'node:fs/promises';
@@ -35,7 +40,7 @@ import { join } from 'node:path';
 
 const server = new McpServer({
   name: 'browser-mcp',
-  version: '1.5.0'
+  version: '2.0.0'
 }, {
   capabilities: {
     tools: {}
@@ -117,6 +122,53 @@ function formatToolError(err) {
     content: [{ type: 'text', text: `${code}${err.message}` }],
     isError: true
   };
+}
+
+/**
+ * Run a STATIC expression — one defined in this repository (src/helpers.js,
+ * src/webgl.js), never assembled from tool arguments — and return its JSON
+ * value.
+ */
+async function evaluateStatic(browser, expression, timeoutMs = 5000) {
+  const result = await browser.send('Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true
+  }, timeoutMs);
+
+  if (result.exceptionDetails) {
+    const details = result.exceptionDetails;
+    throw new Error(details.exception?.description || details.text || 'page evaluation failed');
+  }
+  return result.result?.value ?? null;
+}
+
+/**
+ * Reload the current page and wait for the load event.
+ *
+ * browser_webgl_shim needs this: Page.addScriptToEvaluateOnNewDocument only
+ * applies to documents created after the registration, so a reload is what
+ * actually installs (or removes) the shim for the page you are looking at.
+ */
+async function reloadPage(browser, timeoutMs) {
+  let loaded = false;
+  const onLoad = () => { loaded = true; };
+
+  browser.cdp.on('Page.loadEventFired', onLoad);
+  try {
+    await browser.send('Page.reload', { ignoreCache: true }, timeoutMs);
+
+    const start = Date.now();
+    while (!loaded && Date.now() - start < timeoutMs) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if (!loaded) {
+      throw new Error(`Reload timed out after ${timeoutMs}ms`);
+    }
+    await waitForSettle(browser).catch(() => {});
+  } finally {
+    browser.cdp.off('Page.loadEventFired', onLoad);
+  }
 }
 
 /**
@@ -1558,6 +1610,428 @@ registerTool(
 
       } catch (err) {
         process.stderr.write(`[MCP] Press error: ${err.message}\n`);
+        return formatToolError(err);
+      }
+    });
+  }
+);
+
+// ===========================================================================
+// WebGL tools
+//
+// This environment cannot create a WebGL context, and every flag combination
+// that would enable one takes the whole browser down (`GPU process isn't
+// usable`). The environment is therefore treated as fixed, and the gap is
+// closed with four substitutes: know (webgl_info), boot (webgl_shim),
+// read-the-intent (webgl_trace), and see-another-way (canvas_info,
+// capture_frames). See src/webgl.js for the shim itself.
+// ===========================================================================
+
+/*
+ * Frame capture — why the screencast needs a pump.
+ *
+ * Measured in headless Chromium 150:
+ *   - HeadlessExperimental.beginFrame no longer exists ("'HeadlessExperimental
+ *     .beginFrame' wasn't found (-32601)"), so the compositor has no vsync
+ *     source and commits a frame only when something asks for one.
+ *   - A bare Page.startScreencast on a page with no visible animation measured
+ *     ONE frame in six seconds; with an animation it flows, but at a cadence
+ *     the caller cannot control.
+ *   - A throwaway Page.captureScreenshot per step forces a commit, after which
+ *     the screencast delivers one frame per pump (measured 33 frames / 32 pumps
+ *     over six seconds).
+ *
+ * Hence pump: 'screenshot' is the default. pump: 'none' is kept so the
+ * difference can be observed rather than assumed.
+ */
+async function captureFramesViaScreencast(browser, { count, format, quality, timeoutMs, pump }) {
+  const frames = [];
+  const started = Date.now();
+  let pumpCount = 0;
+
+  const onFrame = (params) => {
+    frames.push({ data: params.data });
+    // Without the ack Chromium stops sending frames after the first one.
+    browser.cdp.send('Page.screencastFrameAck', { sessionId: params.sessionId }, 5000)
+      .catch(() => {});
+  };
+
+  // Without a pump there is nothing to drive the compositor; do not burn the
+  // whole timeout waiting for frames that will not come.
+  const budget = pump === 'none' ? Math.min(timeoutMs, 1500) : timeoutMs;
+
+  browser.cdp.on('Page.screencastFrame', onFrame);
+  try {
+    await browser.send('Page.startScreencast', { format, quality, everyNthFrame: 1 }, 10000);
+
+    while (frames.length < count && Date.now() - started < budget) {
+      if (pump === 'screenshot') {
+        // Throwaway capture whose only job is to force a compositor commit; the
+        // image is discarded and the screencast frame is the one kept.
+        await browser.send('Page.captureScreenshot', { format: 'jpeg', quality: 20 }, 15000)
+          .catch(() => {});
+        pumpCount++;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  } finally {
+    // Always stop the stream: a lingering listener would keep receiving frames
+    // and hold memory for the rest of the session.
+    await browser.send('Page.stopScreencast', {}, 5000).catch(() => {});
+    browser.cdp.off('Page.screencastFrame', onFrame);
+  }
+
+  return { raw: frames, elapsed: Date.now() - started, pumpCount };
+}
+
+async function captureFramesViaPoll(browser, { count, intervalMs, format, quality, selector, timeoutMs }) {
+  const raw = [];
+  const started = Date.now();
+
+  let clip = null;
+  if (selector) {
+    const box = await getBoundingBox(browser, selector, timeoutMs);
+    if (!box || box.width <= 0 || box.height <= 0) {
+      throw toolError(ERRORS.ELEMENT_HIDDEN, `Element has no capturable area: ${selector}`);
+    }
+    clip = { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 };
+  }
+
+  for (let i = 0; i < count; i++) {
+    const params = { format };
+    if (format === 'jpeg') params.quality = quality;
+    if (clip) {
+      params.clip = clip;
+      params.captureBeyondViewport = false;
+    }
+
+    const shot = await browser.send('Page.captureScreenshot', params, 30000);
+    raw.push({ data: shot.data });
+
+    if (i < count - 1 && intervalMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  return { raw, clip, elapsed: Date.now() - started };
+}
+
+registerTool(
+  'browser_webgl_info',
+  'Report whether the current page can use WebGL, and why not',
+  {},
+  async () => {
+    try {
+      await ensureBrowserReady();
+
+      if (navigationPromise) {
+        await navigationPromise.catch(() => {});
+      }
+
+      process.stderr.write('[MCP] Probing WebGL availability\n');
+
+      const report = await webglInfo(browser);
+      resetIdleTimer();
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(report) }]
+      };
+
+    } catch (err) {
+      process.stderr.write(`[MCP] WebGL info error: ${err.message}\n`);
+      return formatToolError(err);
+    }
+  }
+);
+
+registerTool(
+  'browser_canvas_info',
+  'Describe every canvas on the page and whether it is blank',
+  {
+    max_canvases: z.number().int().min(1).max(200).optional().default(CONFIG.MAX_WEBGL_CANVASES)
+  },
+  async ({ max_canvases }) => {
+    try {
+      await ensureBrowserReady();
+
+      if (navigationPromise) {
+        await navigationPromise.catch(() => {});
+      }
+
+      process.stderr.write(`[MCP] Inspecting canvases (max ${max_canvases})\n`);
+
+      const report = await canvasInfo(browser, max_canvases);
+      resetIdleTimer();
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(report) }]
+      };
+
+    } catch (err) {
+      process.stderr.write(`[MCP] Canvas info error: ${err.message}\n`);
+      return formatToolError(err);
+    }
+  }
+);
+
+registerTool(
+  'browser_webgl_trace',
+  'Read back the WebGL activity recorded by browser_webgl_shim (shader sources, uniforms, draw calls)',
+  {
+    clear: z.boolean().optional().default(false)
+  },
+  async ({ clear }) => {
+    try {
+      await ensureBrowserReady();
+
+      if (navigationPromise) {
+        await navigationPromise.catch(() => {});
+      }
+
+      process.stderr.write(`[MCP] Reading WebGL trace${clear ? ' (and clearing it)' : ''}\n`);
+
+      const summary = await evaluateStatic(browser, TRACE_SUMMARY_EXPRESSION, 10000);
+
+      if (!summary || summary.installed !== true) {
+        return formatToolError(toolError(
+          ERRORS.WEBGL_TRACE_UNAVAILABLE,
+          'No WebGL shim is installed, so nothing has been recorded. Enable ' +
+          'ENABLE_WEBGL_SHIM=1, call browser_webgl_shim with mode "trace", and ' +
+          'let the page reload first.'
+        ));
+      }
+
+      const response = { available: true, ...summary };
+
+      if (summary.mode === 'mock') {
+        response.note =
+          'The shim is in "mock" mode, which keeps counters only. Re-install it ' +
+          'with mode "trace" for shader sources, uniforms and per-draw details.';
+      } else if (summary.recordCount === 0) {
+        response.note =
+          'The trace is empty: the page has not created a WebGL context or issued ' +
+          'a draw call since the last reload.';
+      }
+
+      if (clear) {
+        await evaluateStatic(browser, TRACE_CLEAR_EXPRESSION, 5000);
+        response.cleared = true;
+      }
+
+      resetIdleTimer();
+
+      const json = JSON.stringify(response);
+      const cut = truncateText(json, CONFIG.MAX_WEBGL_TRACE_LENGTH);
+
+      return {
+        content: [{
+          type: 'text',
+          text: cut.truncated
+            ? JSON.stringify({
+              truncated: true,
+              reason: `response exceeded MAX_WEBGL_TRACE_LENGTH (${CONFIG.MAX_WEBGL_TRACE_LENGTH} characters)`,
+              json: cut.text
+            })
+            : json
+        }]
+      };
+
+    } catch (err) {
+      process.stderr.write(`[MCP] WebGL trace error: ${err.message}\n`);
+      return formatToolError(err);
+    }
+  }
+);
+
+registerTool(
+  'browser_webgl_shim',
+  'Install or remove the pre-navigation WebGL stand-in (off | mock | trace), so a WebGL app can boot without a GPU',
+  {
+    mode: z.enum(['off', 'mock', 'trace']),
+    reload: z.boolean().optional().default(true),
+    timeout_ms: z.number().max(CONFIG.MAX_TIMEOUT_MS).optional().default(CONFIG.DEFAULT_TIMEOUT_MS)
+  },
+  async ({ mode, reload, timeout_ms }) => {
+    // Security gate: the shim injects code into every document the browser
+    // loads, and it makes a page without rendering capability behave as though
+    // it had one. Never start the browser unless explicitly enabled.
+    if (!isWebglShimEnabled()) {
+      return formatToolError(toolError(
+        ERRORS.WEBGL_SHIM_DISABLED,
+        'browser_webgl_shim is disabled by default: it injects a WebGL stand-in ' +
+        'into every document this browser loads (Page.addScriptToEvaluateOnNewDocument), ' +
+        'so the page reports a rendering capability it does not have. Set ' +
+        'ENABLE_WEBGL_SHIM=1 in the MCP server environment to enable it for pages you trust.'
+      ));
+    }
+
+    return runLocked(async () => {
+      try {
+        await ensureBrowserReady();
+
+        if (navigationPromise) {
+          await navigationPromise.catch(() => {});
+        }
+
+        const timeout = capTimeout(timeout_ms, CONFIG.DEFAULT_TIMEOUT_MS);
+        process.stderr.write(`[MCP] WebGL shim: mode=${mode} reload=${reload}\n`);
+
+        const identifier = await browser.applyWebglShim(mode);
+
+        const response = {
+          mode,
+          identifier: identifier ?? null,
+          // Always say who is serving WebGL: a shimmed result must never be
+          // mistaken for GPU rendering.
+          shimmed: mode !== 'off',
+          appliesTo: mode === 'off' ? 'nothing' : 'documents created after this call',
+          reloadRequired: !reload,
+          reloaded: false
+        };
+
+        if (reload) {
+          await reloadPage(browser, timeout);
+          response.reloaded = true;
+          response.reloadRequired = false;
+        } else {
+          response.note =
+            'The current document is unchanged — reload or navigate for this to take effect.';
+        }
+
+        resetIdleTimer();
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(response) }]
+        };
+
+      } catch (err) {
+        process.stderr.write(`[MCP] WebGL shim error: ${err.message}\n`);
+        return formatToolError(err);
+      }
+    });
+  }
+);
+
+registerTool(
+  'browser_capture_frames',
+  'Capture a sequence of frames (screencast or poll) — for animation that a single screenshot misses',
+  {
+    count: z.number().int().min(1).max(60).optional().default(4),
+    interval_ms: z.number().int().min(0).max(5000).optional().default(200),
+    format: z.enum(['jpeg', 'png']).optional().default('jpeg'),
+    quality: z.number().min(1).max(100).optional().default(80),
+    strategy: z.enum(['screencast', 'poll']).optional().default('screencast'),
+    pump: z.enum(['screenshot', 'none']).optional().default('screenshot'),
+    selector: z.string().optional(),
+    filename_prefix: z.string().optional().default('frame'),
+    timeout_ms: z.number().max(CONFIG.MAX_TIMEOUT_MS).optional().default(30000)
+  },
+  async ({ count, interval_ms, format, quality, strategy, pump, selector, filename_prefix, timeout_ms }) => {
+    return runLocked(async () => {
+      try {
+        await ensureBrowserReady();
+
+        if (navigationPromise) {
+          await navigationPromise.catch(() => {});
+        }
+
+        const timeout = capTimeout(timeout_ms, 30000);
+        const extension = format === 'jpeg' ? '.jpg' : '.png';
+
+        // Validate every target path before capturing anything, so a traversal
+        // attempt fails without writing a single frame.
+        const paths = [];
+        for (let i = 0; i < count; i++) {
+          const name = `${filename_prefix}-${String(i + 1).padStart(2, '0')}${extension}`;
+          const validation = validateSafePath(name, OUTPUT_DIR);
+          if (!validation.valid) {
+            return {
+              content: [{ type: 'text', text: validation.error }],
+              isError: true
+            };
+          }
+          paths.push(validation.path);
+        }
+
+        process.stderr.write(
+          `[MCP] Capturing ${count} frame(s) via ${strategy}` +
+          `${strategy === 'screencast' ? ` (pump=${pump})` : ''}` +
+          `${selector ? ` clipped to ${selector}` : ''}\n`
+        );
+
+        await mkdir(OUTPUT_DIR, { recursive: true });
+
+        const captured = strategy === 'screencast'
+          ? await captureFramesViaScreencast(browser, {
+            count, format, quality, timeoutMs: timeout, pump
+          })
+          : await captureFramesViaPoll(browser, {
+            count, intervalMs: interval_ms, format, quality, selector, timeoutMs: timeout
+          });
+
+        // Screencast is push-based: frames can arrive between pump iterations,
+        // so the stream may overrun the request. Hand back exactly what was asked.
+        const raw = captured.raw.slice(0, count);
+        const extraCaptured = captured.raw.length - raw.length;
+
+        const frames = [];
+        for (let i = 0; i < raw.length; i++) {
+          const buffer = Buffer.from(raw[i].data, 'base64');
+
+          // Per-frame byte cap. Unlike a single screenshot, a frame cannot be
+          // re-captured at a smaller scale, so refuse instead of writing a file
+          // that breaks the response-size contract.
+          if (buffer.length > CONFIG.MAX_IMAGE_BYTES) {
+            return formatToolError(toolError(
+              ERRORS.SCREENSHOT_TOO_LARGE,
+              `Frame ${i + 1} is ${buffer.length} bytes, over MAX_IMAGE_BYTES ` +
+              `(${CONFIG.MAX_IMAGE_BYTES}). Lower "quality", keep format "jpeg", ` +
+              'or capture fewer frames.'
+            ));
+          }
+
+          await writeFile(paths[i], buffer);
+          const dims = decodeImageSize(buffer, format);
+
+          frames.push({
+            index: i + 1,
+            path: paths[i],
+            size: buffer.length,
+            width: dims?.width ?? null,
+            height: dims?.height ?? null
+          });
+        }
+
+        resetIdleTimer();
+
+        const response = {
+          strategy,
+          requested: count,
+          captured: frames.length,
+          format,
+          frames,
+          elapsed_ms: captured.elapsed,
+          ...(captured.clip ? { clip: captured.clip } : {}),
+          ...(captured.pumpCount !== undefined ? { pump, pumpCount: captured.pumpCount } : {}),
+          ...(extraCaptured > 0 ? { extraCaptured } : {})
+        };
+
+        // Never report a short capture as a success.
+        if (frames.length < count) {
+          response.shortBy = count - frames.length;
+          response.note = strategy === 'screencast' && pump === 'none'
+            ? 'Headless Chromium commits a frame only when something asks for one, ' +
+              'so an unpumped screencast delivers few. Use pump: "screenshot" (the ' +
+              'default) or strategy: "poll".'
+            : 'Fewer frames arrived than requested within the timeout.';
+        }
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(response) }]
+        };
+
+      } catch (err) {
+        process.stderr.write(`[MCP] Capture frames error: ${err.message}\n`);
         return formatToolError(err);
       }
     });

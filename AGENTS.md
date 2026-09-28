@@ -25,15 +25,16 @@ No lint, typecheck, or build step exists.
 
 ## Architecture
 
-- `index.js` — MCP server entrypoint; registers 14 tools (`browser_navigate`, `browser_get_url`, `browser_get_text`, `browser_screenshot`, `browser_get_console`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_wait_for`, `browser_scroll`, `browser_resize`, `browser_evaluate`, `browser_hover`, `browser_press`); operation lock serializes state-changing ops; idle timer + activity tracking; same-document (hash) navigation handled via `Page.navigatedWithinDocument`; full-page screenshots warm up lazy rendering and capture with `captureBeyondViewport` — the viewport is NOT resized to the page height
-- `src/browser.js` — Chromium lifecycle: spawn, CDP port discovery via `DevToolsActivePort`, WebSocket connect, WS-reconnect (same process, backoff), crash auto-restart (new process, SAME profile so page state survives), process-group cleanup; holds the persistent `viewport` override and re-applies it in `_connectToPage`. Domains enabled: Page, Runtime, Network, DOM, Accessibility (Emulation needs no `enable` command)
+- `index.js` — MCP server entrypoint; registers 19 tools (`browser_navigate`, `browser_get_url`, `browser_get_text`, `browser_screenshot`, `browser_get_console`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_wait_for`, `browser_scroll`, `browser_resize`, `browser_evaluate`, `browser_hover`, `browser_press`, `browser_webgl_info`, `browser_canvas_info`, `browser_webgl_shim`, `browser_webgl_trace`, `browser_capture_frames`); operation lock serializes state-changing ops; idle timer + activity tracking; same-document (hash) navigation handled via `Page.navigatedWithinDocument`; full-page screenshots warm up lazy rendering and capture with `captureBeyondViewport` — the viewport is NOT resized to the page height
+- `src/browser.js` — Chromium lifecycle: spawn, CDP port discovery via `DevToolsActivePort`, WebSocket connect, WS-reconnect (same process, backoff), crash auto-restart (new process, SAME profile so page state survives), process-group cleanup; holds the persistent `viewport` override and the `webglShim` registration, both re-applied in `_connectToPage`. Domains enabled: Page, Runtime, Network, DOM, Accessibility (Emulation needs no `enable` command)
 - `src/cdp.js` — Raw CDP WebSocket client (EventEmitter-based, request/response correlation by ID)
-- `src/helpers.js` — In-page interaction helpers executed via `Runtime.callFunctionOn` (static function strings; selectors/text always passed as CDP arguments, never concatenated)
+- `src/helpers.js` — In-page interaction helpers executed via `Runtime.callFunctionOn` (static function strings; selectors/text always passed as CDP arguments, never concatenated). Also hosts the read-only WebGL/canvas probes (`IN_PAGE.webglInfo`, `IN_PAGE.canvasInfo`)
+- `src/webgl.js` — The WebGL shim: `SHIM_BASE` + `SHIM_TRACE_EXTENSION` (static source strings only, composed for `mock`/`trace`), the in-page trace summary/clear expressions, and `classifyWebglMessages` (console signatures for three.js/Babylon/PixiJS/Mapbox/PlayCanvas)
 - `src/viewport.js` — Viewport presets + `resolveViewportParams` (validates RAW resize args, not Zod-normalized ones)
 - `src/keymap.js` — `resolveKey`: named keys + single characters → `{ key, code, keyCode, text, modifiers }` for `browser_press`
 - `src/lock.js` — Operation lock (FIFO mutex, queue limit `CONFIG.QUEUE_LIMIT`, `BUSY_QUEUE_FULL`)
 - `src/console-buffer.js` — In-memory ring buffer for console messages
-- `src/utils.js` — URL validation (rejects `file:`/`javascript:`/`data:`, blocks private IPs by default), path traversal checks, truncation helpers, `isEvalJsEnabled`, `decodeImageSize` (PNG/JPEG header decode), env-driven limits
+- `src/utils.js` — URL validation (rejects `file:`/`javascript:`/`data:`, blocks private IPs by default), path traversal checks, truncation helpers, capability gates (`isEvalJsEnabled`, `isWebglShimEnabled`), `decodeImageSize` (PNG/JPEG header decode), env-driven limits
 
 ## Key behaviors
 
@@ -55,19 +56,26 @@ No lint, typecheck, or build step exists.
 - `browser_hover` moves the real mouse to an unobstructed point (center + quadrants), nudges (away/back) if `:hover` does not engage, and reports `matchesHover` (diagnostic). `browser_press` resolves keys via `src/keymap.js`; Enter/Tab/Space carry text so default actions (form submit, focus traversal) fire; a single-character key is logged as `<char>`.
 - Screenshot limits are enforced by **post-capture measurement**: the real PNG/JPEG dimensions are decoded from the buffer (`decodeImageSize`) and the byte size checked; oversized captures are downscaled via `clip.scale` (never cropped) and re-captured at most once, else `[SCREENSHOT_TOO_LARGE]`. `mobile: true` page scale is caught this way because the pre-capture estimate can under-count.
 - All logging goes to stderr; stdout is reserved for MCP JSON-RPC.
+- **WebGL does not exist in this environment** and cannot be enabled: the GPU process exits with `exit_code=256`, and adding any WebGL-enabling flag (`--enable-unsafe-swiftshader`, `--use-angle=swiftshader`, `--in-process-gpu`, …) ends in `FATAL: GPU process isn't usable. Goodbye.` — the current flag set is what keeps the browser alive. Do not "fix" this with flags; the tools below are the substitute.
+- `browser_webgl_info` reports `effective` as `real` / `shimmed` / `unavailable` (`usable` is true only for `real`) and classifies WebGL console errors, since a WebGL app that fails to boot leaves no other evidence on the page.
+- `browser_canvas_info` measures each canvas's pixels (≤64×64 sample) so a blank canvas is distinguishable from one that was never drawn; a canvas served by the shim is reported as blank *on purpose*.
+- `browser_webgl_shim` registers its source with `Page.addScriptToEvaluateOnNewDocument` — it applies to documents created *after* the call, which is why it reloads by default. Mode `off` removes the registration. The registration is remembered on `Browser.webglShim` and re-applied in `_connectToPage` (a CDP registration does not survive a reconnect or restart). Every result carries `shimmed: true`.
+- `browser_webgl_trace` reads the shim's bounded recorder (400 records; ≤8 shaders, ≤60 draws, ≤40 uniforms, ≤20 textures returned). It refuses with `[WEBGL_TRACE_UNAVAILABLE]` when no shim is installed.
+- `browser_capture_frames` runs `Page.startScreencast` with an explicit frame pump (`pump: 'screenshot'`) because headless Chromium 150 has no `HeadlessExperimental.beginFrame` and no vsync source: a bare screencast measured **1 frame in 6 seconds** on an idle page. The stream is trimmed to `count` (surplus reported as `extraCaptured`) and a short capture returns `shortBy` + `note` instead of a false success. `strategy: 'poll'` is the deterministic alternative and supports `selector` clipping.
 
 ## Security rules
 
 - Selectors and typed text are passed to in-page helpers as CDP `arguments` values — NEVER concatenated into JavaScript source.
 - `browser_type` never logs the typed text (may contain passwords/tokens); `browser_press` logs a single-character key as `<char>`.
 - `browser_evaluate` is gated behind `ENABLE_EVAL_JS` (off by default); when on it can read page data and reach internal networks via `fetch()` (SSRF).
+- `browser_webgl_shim` is gated behind `ENABLE_WEBGL_SHIM` (off by default); when on it injects a fixed script into every document the browser loads, so a page reports a rendering capability it does not have. Its source is static text from `src/webgl.js` — never built from tool arguments — and every result is marked `shimmed: true`.
 - URL scheme whitelist (http/https/about), private-IP blocking (`ALLOW_PRIVATE_NETWORKS`), screenshot path traversal checks.
 
 ## Test conventions
 
 - Tests use `node:test` with `node:assert/strict` — no external test framework.
-- `fixtures/test-page.html` is the shared test fixture (also `fixtures/page2.html` for navigation tests). `fixtures/lazy-page.html` (IntersectionObserver), `fixtures/tall-page.html` (3000×19400, pixel-checked full-page capture) and `fixtures/rtl-page.html` (Arabic RTL: fixed sidebar, `100vh` hero) cover the full-page screenshot paths.
-- `tests/harness.js` holds the shared integration harness (fixture server, MCP child process, buffered JSON-RPC, `assertSuccess`/`getText`). Responses are reassembled across stdout chunks, so large inline screenshot payloads resolve.
+- `fixtures/test-page.html` is the shared test fixture (also `fixtures/page2.html` for navigation tests). `fixtures/lazy-page.html` (IntersectionObserver), `fixtures/tall-page.html` (3000×19400, pixel-checked full-page capture) and `fixtures/rtl-page.html` (Arabic RTL: fixed sidebar, `100vh` hero) cover the full-page screenshot paths. `fixtures/webgl-page.html` is a WebGL app (a shader pair drawn on a `<canvas>`, plus a Canvas2D control and a DOM animation) — it fails to boot without the shim, which is what `tests/webgl.test.js` asserts.
+- `tests/harness.js` holds the shared integration harness (fixture server, MCP child process, buffered JSON-RPC, `assertSuccess`/`getText`). Responses are reassembled across stdout chunks, so large inline screenshot payloads resolve. It strips the opt-in gates (`ENABLE_EVAL_JS`, `ENABLE_WEBGL_SHIM`) from the inherited environment so the disabled default is what gets tested.
 - `npm test` uses `--test-concurrency=3`: 13+ files each spawn Chromium; full parallelism exhausts RAM on small devices.
 
 ## Documentation Rules

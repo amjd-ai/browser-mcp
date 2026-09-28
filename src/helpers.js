@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 
 import { resolveKey } from './keymap.js';
+import { classifyWebglMessages } from './webgl.js';
 
 export const IN_PAGE = {
   // document.querySelector. `this` is the document node.
@@ -101,6 +102,13 @@ export const IN_PAGE = {
     const vh = window.innerHeight || document.documentElement.clientHeight;
     return rect.top >= 0 && rect.left >= 0 &&
       rect.bottom <= vh && rect.right <= vw;
+  }`,
+
+  // Viewport-relative bounding box of this element, in CSS pixels. `this` is
+  // the element. Used for element-clipped captures.
+  getBoundingBox: `function() {
+    const rect = this.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
   }`,
 
   // Wait for the next paint after a state change (double rAF ensures the
@@ -397,6 +405,182 @@ export const IN_PAGE = {
     }
 
     return serialize(this, 0, new WeakSet());
+  }`,
+
+  // Probe WebGL availability in this document. Creates a throwaway canvas per
+  // context type (a real context is not reusable for a different type), reads
+  // the driver strings and limits when one succeeds, and releases it again via
+  // WEBGL_lose_context so the probe does not hold a context slot. Reports the
+  // shim's own globals too, so caller and page agree on who is serving WebGL.
+  webglInfo: `function() {
+    function probe(type) {
+      var canvas = document.createElement('canvas');
+      canvas.width = 32;
+      canvas.height = 32;
+
+      var gl = null;
+      var error = null;
+      try {
+        gl = canvas.getContext(type);
+      } catch (e) {
+        error = String((e && e.message) || e);
+      }
+
+      if (!gl) return { ok: false, error: error };
+
+      var info = {
+        ok: true,
+        mock: gl.__mcpMock === true,
+        vendor: null,
+        renderer: null,
+        version: null,
+        maxTextureSize: null,
+        maxRenderbufferSize: null,
+        extensionCount: 0,
+        extensions: [],
+        unmasked: null
+      };
+
+      try {
+        info.vendor = gl.getParameter(gl.VENDOR);
+        info.renderer = gl.getParameter(gl.RENDERER);
+        info.version = gl.getParameter(gl.VERSION);
+        info.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+        info.maxRenderbufferSize = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+
+        var extensions = gl.getSupportedExtensions ? gl.getSupportedExtensions() : [];
+        info.extensions = extensions ? extensions.slice(0, 20) : [];
+        info.extensionCount = extensions ? extensions.length : 0;
+
+        if (gl.getExtension) {
+          var debug = gl.getExtension('WEBGL_debug_renderer_info');
+          if (debug) {
+            info.unmasked = {
+              vendor: gl.getParameter(debug.UNMASKED_VENDOR_WEBGL),
+              renderer: gl.getParameter(debug.UNMASKED_RENDERER_WEBGL)
+            };
+          }
+          var lose = gl.getExtension('WEBGL_lose_context');
+          if (lose) lose.loseContext();
+        }
+      } catch (e) {
+        info.probeError = String((e && e.message) || e);
+      }
+
+      return info;
+    }
+
+    function probeOffscreen(type) {
+      if (typeof OffscreenCanvas === 'undefined') return { supported: false };
+      try {
+        var offscreen = new OffscreenCanvas(32, 32);
+        var gl = offscreen.getContext(type);
+        return { supported: true, ok: !!gl, mock: !!(gl && gl.__mcpMock === true) };
+      } catch (e) {
+        return { supported: true, ok: false, error: String((e && e.message) || e) };
+      }
+    }
+
+    var shim = window.__mcpWebglShim || null;
+
+    return {
+      interfaces: {
+        WebGLRenderingContext: typeof WebGLRenderingContext !== 'undefined',
+        WebGL2RenderingContext: typeof WebGL2RenderingContext !== 'undefined',
+        OffscreenCanvas: typeof OffscreenCanvas !== 'undefined',
+        WebGPUNavigator: (typeof navigator !== 'undefined' && 'gpu' in navigator)
+      },
+      contexts: { webgl: probe('webgl'), webgl2: probe('webgl2') },
+      offscreen: { webgl: probeOffscreen('webgl'), webgl2: probeOffscreen('webgl2') },
+      shim: shim
+        ? { active: !!shim.active, mode: shim.mode, mockedContexts: shim.mockedContexts || 0 }
+        : { active: false, mode: null, mockedContexts: 0 }
+    };
+  }`,
+
+  // Describe every canvas: size, position, which context is serving it, and
+  // whether it actually holds pixels. Blankness is measured by drawing the
+  // canvas into an offscreen 2D canvas and sampling it (capped at 64x64, so the
+  // cost is constant per canvas regardless of its real size).
+  canvasInfo: `function(maxCanvases) {
+    function pixelStats(canvas) {
+      var w = Math.min(canvas.width || Math.ceil(canvas.clientWidth) || 1, 64);
+      var h = Math.min(canvas.height || Math.ceil(canvas.clientHeight) || 1, 64);
+      if (w < 1 || h < 1) return null;
+
+      var probe = document.createElement('canvas');
+      probe.width = w;
+      probe.height = h;
+
+      var ctx = null;
+      try { ctx = probe.getContext('2d'); } catch (e) { ctx = null; }
+      if (!ctx) return { error: 'no-2d-context' };
+
+      try {
+        ctx.drawImage(canvas, 0, 0, w, h);
+      } catch (e) {
+        return { error: String((e && e.message) || e) };
+      }
+
+      var data;
+      try {
+        data = ctx.getImageData(0, 0, w, h).data;
+      } catch (e) {
+        return { error: String((e && e.message) || e) };
+      }
+
+      var seen = new Set();
+      var nonTransparent = 0;
+      for (var i = 0; i < data.length; i += 4) {
+        if (data[i + 3] !== 0) nonTransparent++;
+        if (seen.size < 64) {
+          seen.add(data[i] + ',' + data[i + 1] + ',' + data[i + 2] + ',' + data[i + 3]);
+        }
+      }
+
+      return {
+        sampledWidth: w,
+        sampledHeight: h,
+        uniqueColors: seen.size,
+        nonTransparentRatio: Math.round((nonTransparent / (w * h)) * 1000) / 1000,
+        blank: seen.size <= 1
+      };
+    }
+
+    var canvases = document.querySelectorAll('canvas');
+    var limit = Math.min(canvases.length, maxCanvases);
+    var entries = [];
+
+    for (var i = 0; i < limit; i++) {
+      var c = canvases[i];
+      var rect = c.getBoundingClientRect();
+
+      var entry = {
+        index: i,
+        id: c.id || null,
+        className: (typeof c.className === 'string' && c.className) || null,
+        attributeSize: { width: c.width, height: c.height },
+        cssSize: { width: Math.round(rect.width), height: Math.round(rect.height) },
+        position: { x: Math.round(rect.x), y: Math.round(rect.y) },
+        mockContextType: c.__mcpMockContext || null,
+        pixels: pixelStats(c)
+      };
+
+      try {
+        entry.dataUrlLength = c.toDataURL().length;
+      } catch (e) {
+        entry.dataUrlError = String((e && e.message) || e);
+      }
+
+      entries.push(entry);
+    }
+
+    return {
+      count: canvases.length,
+      sampled: entries.length,
+      truncated: canvases.length > limit,
+      canvases: entries
+    };
   }`
 };
 
@@ -534,6 +718,17 @@ export async function scrollIntoView(browser, elementId) {
 
 export async function getClickablePoint(browser, elementId) {
   const result = await callHelper(browser, IN_PAGE.getClickablePoint, { objectId: elementId });
+  return result.value;
+}
+
+/**
+ * Resolve a selector and return its viewport-relative bounding box in CSS
+ * pixels, or throw ELEMENT_NOT_FOUND. The selector is passed as a CDP argument,
+ * never concatenated into the page code.
+ */
+export async function getBoundingBox(browser, selector, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const elementId = await waitForElement(browser, selector, timeoutMs);
+  const result = await callHelper(browser, IN_PAGE.getBoundingBox, { objectId: elementId });
   return result.value;
 }
 
@@ -995,6 +1190,90 @@ export async function evaluateExpression(browser, expression, options = {}) {
   return { type: remote.type || 'object', value: remote.value === undefined ? null : remote.value };
 }
 
+/**
+ * Report whether the page can use WebGL, and why not.
+ *
+ * Read-only and independent of browser_evaluate: it runs a fixed expression, so
+ * it needs no opt-in. `effective` is the short answer — 'real' for a real
+ * context, 'shimmed' for one served by browser_webgl_shim, 'unavailable' when
+ * neither could be created. The console hits matter as much as the probe: a
+ * WebGL app that fails to boot leaves no other trace on the page.
+ */
+export async function webglInfo(browser, { includeConsole = true } = {}) {
+  const result = await callHelper(browser, IN_PAGE.webglInfo);
+  const probe = result.value || {};
+
+  const gl1 = probe.contexts?.webgl || null;
+  const gl2 = probe.contexts?.webgl2 || null;
+  const real = (gl1?.ok === true && gl1.mock !== true) || (gl2?.ok === true && gl2.mock !== true);
+  const shimmed =
+    (gl1?.ok === true && gl1.mock === true) || (gl2?.ok === true && gl2.mock === true);
+
+  const report = {
+    usable: real,
+    effective: shimmed ? 'shimmed' : (real ? 'real' : 'unavailable'),
+    webgl: gl1,
+    webgl2: gl2,
+    offscreen: probe.offscreen || null,
+    interfaces: probe.interfaces || null,
+    shim: probe.shim || { active: false, mode: null, mockedContexts: 0 }
+  };
+
+  if (report.effective === 'unavailable') {
+    report.reason = 'No WebGL context could be created in this environment';
+    report.advice =
+      'WebGL output is unavailable. If the app must boot anyway, enable browser_webgl_shim ' +
+      '(ENABLE_WEBGL_SHIM=1) with mode "mock" or "trace" and reload.';
+  } else if (shimmed) {
+    report.reason = 'WebGL is served by the shim, not by a GPU — nothing is rasterized';
+    report.advice =
+      'Use browser_webgl_trace to inspect what the page intended to draw, and ' +
+      'browser_canvas_info to confirm the canvas is blank on purpose.';
+  }
+
+  if (includeConsole && browser.consoleBuffer) {
+    const hits = classifyWebglMessages(browser.consoleBuffer.getMessages('all'));
+    if (hits.length > 0) report.consoleHits = hits;
+  }
+
+  return report;
+}
+
+/** Plain-language verdict for one canvas, so the numbers are not left to guesswork. */
+function canvasVerdict(entry) {
+  if (entry.pixels?.blank === true && entry.mockContextType) {
+    return `Blank on purpose: this canvas holds a "${entry.mockContextType}" context served by the ` +
+      'WebGL shim, which records calls but rasterizes nothing. Inspect browser_webgl_trace instead.';
+  }
+  if (entry.pixels?.blank === true) {
+    return 'Blank: nothing was drawn into this canvas (or it was cleared and never re-rendered).';
+  }
+  return 'Has pixel content.';
+}
+
+/**
+ * Describe every canvas on the page and whether it holds pixels. This is what
+ * separates "the app is broken" from "nothing here can rasterize".
+ */
+export async function canvasInfo(browser, maxCanvases = 50) {
+  const result = await callHelper(browser, IN_PAGE.canvasInfo, {
+    args: [maxCanvases]
+  });
+  const page = result.value || { canvases: [] };
+  const canvases = (page.canvases || []).map(entry => ({
+    ...entry,
+    verdict: canvasVerdict(entry)
+  }));
+
+  return {
+    count: page.count ?? canvases.length,
+    blank: canvases.filter(c => c.pixels?.blank === true).length,
+    sampled: page.sampled ?? canvases.length,
+    truncated: page.truncated === true,
+    canvases
+  };
+}
+
 export default {
   IN_PAGE,
   normalizeWhitespace,
@@ -1003,6 +1282,7 @@ export default {
   isElementVisible,
   scrollIntoView,
   getClickablePoint,
+  getBoundingBox,
   scrollByDirection,
   scrollToPosition,
   scrollToElement,
@@ -1020,5 +1300,7 @@ export default {
   isHovered,
   hoverElement,
   pressKey,
-  evaluateExpression
+  evaluateExpression,
+  webglInfo,
+  canvasInfo
 };

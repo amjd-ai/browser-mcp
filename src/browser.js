@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { CDPClient } from './cdp.js';
 import { ConsoleBuffer } from './console-buffer.js';
 import { ERRORS } from './utils.js';
+import { SHIM_MODES, SHIM_SOURCES } from './webgl.js';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -72,6 +73,11 @@ export class Browser {
     // restart/reconnect, since the Emulation override does not survive a new
     // Chromium process.
     this.viewport = null;
+    // WebGL shim registration ({ mode, identifier }) installed by
+    // browser_webgl_shim. Like the viewport it is remembered here so it can be
+    // re-registered after a reconnect or a crash restart — the CDP registration
+    // itself does not survive either.
+    this.webglShim = null;
     // Set by a crash restart; the first tool call afterwards reports it so the
     // client knows the old page state is gone.
     this.sessionReset = false;
@@ -98,16 +104,6 @@ export class Browser {
     }
 
     throw new Error('Chromium not found. Set CHROMIUM_PATH environment variable.');
-  }
-
-  getChromiumVersion(execPath) {
-    try {
-      const { execSync } = require('node:child_process');
-      const output = execSync(`${execPath} --version`, { encoding: 'utf8' });
-      return output.trim();
-    } catch {
-      return 'unknown';
-    }
   }
 
   async start({ preserveProfile = false } = {}) {
@@ -248,6 +244,7 @@ export class Browser {
             this._setupConsoleListeners();
             this._setupDialogHandler();
             await this._reapplyViewport();
+            await this._reapplyWebglShim();
             return;
           }
         }
@@ -363,6 +360,71 @@ export class Browser {
       process.stderr.write('[Browser] Re-applied viewport override\n');
     } catch (err) {
       process.stderr.write(`[Browser] Failed to re-apply viewport: ${err.message}\n`);
+    }
+  }
+
+  /**
+   * Register the WebGL shim for documents created from now on, replacing any
+   * previous registration so modes never stack. Returns the CDP identifier, or
+   * null for mode 'off'.
+   *
+   * The registration only affects NEW documents: the document that is already
+   * loaded keeps whatever it had, so the caller reloads (or navigates) to
+   * actually install it.
+   */
+  async applyWebglShim(mode) {
+    if (!SHIM_MODES.includes(mode)) {
+      const err = new Error(`Unknown WebGL shim mode: ${mode}`);
+      err.code = ERRORS.WEBGL_SHIM_MODE_INVALID;
+      throw err;
+    }
+
+    // Replace rather than stack: modes never accumulate registrations.
+    await this.removeWebglShim();
+
+    if (mode === 'off') return null;
+
+    const { identifier } = await this.send(
+      'Page.addScriptToEvaluateOnNewDocument', { source: SHIM_SOURCES[mode] }, 5000
+    );
+    this.webglShim = { mode, identifier };
+    return identifier;
+  }
+
+  /**
+   * Remove the shim registration and forget it. The current document is
+   * unaffected — its mocked context, if any, stays until the next reload.
+   */
+  async removeWebglShim() {
+    if (!this.webglShim) return;
+    const { identifier } = this.webglShim;
+    this.webglShim = null;
+    try {
+      await this.send('Page.removeScriptToEvaluateOnNewDocument', { identifier }, 5000);
+    } catch {
+      // Already gone — the registration does not outlive the CDP session it was
+      // created on, so after a reconnect there is nothing left to remove.
+    }
+  }
+
+  /**
+   * Re-register the remembered WebGL shim after the CDP session is
+   * (re)established. `Page.addScriptToEvaluateOnNewDocument` registrations live
+   * on the session, so both a WebSocket reconnect and a crash restart begin
+   * without one. Same lifecycle concern as the viewport override. Best-effort:
+   * a failure is logged, not thrown.
+   */
+  async _reapplyWebglShim() {
+    if (!this.webglShim) return;
+    const mode = this.webglShim.mode;
+    try {
+      const { identifier } = await this.cdp.send(
+        'Page.addScriptToEvaluateOnNewDocument', { source: SHIM_SOURCES[mode] }, 5000
+      );
+      this.webglShim = { mode, identifier };
+      process.stderr.write(`[Browser] Re-applied WebGL shim (mode=${mode})\n`);
+    } catch (err) {
+      process.stderr.write(`[Browser] Failed to re-apply WebGL shim: ${err.message}\n`);
     }
   }
 

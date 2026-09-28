@@ -25,6 +25,8 @@ const MAX_CONSOLE_MESSAGES = envInt('MAX_CONSOLE_MESSAGES', 500);
 const MAX_SNAPSHOT_ITEMS = envInt('MAX_SNAPSHOT_ITEMS', 100);
 const MAX_SCREENSHOT_PIXELS = envInt('MAX_SCREENSHOT_PIXELS', 16_000_000);
 const MAX_EVAL_LENGTH = envInt('MAX_EVAL_LENGTH', 100_000);
+const MAX_WEBGL_TRACE_LENGTH = envInt('MAX_WEBGL_TRACE_LENGTH', 100_000);
+const MAX_WEBGL_CANVASES = envInt('MAX_WEBGL_CANVASES', 50);
 
 const QUEUE_LIMIT = envInt('QUEUE_LIMIT', 8);
 
@@ -176,6 +178,18 @@ export function isEvalJsEnabled() {
 }
 
 /**
+ * Whether `browser_webgl_shim` is enabled. Disabled by default, for the same
+ * reason as browser_evaluate: the shim injects code into every document the
+ * browser loads (Page.addScriptToEvaluateOnNewDocument), and it makes a page
+ * that has no rendering capability behave as though it had one — a caller must
+ * opt in to that. Accepts 1 / true / yes (case-insensitive).
+ */
+export function isWebglShimEnabled() {
+  const raw = (process.env.ENABLE_WEBGL_SHIM || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes';
+}
+
+/**
  * Read the real pixel dimensions of an encoded PNG or JPEG image buffer,
  * without any external dependency. Returns null when the format is unknown
  * or the header cannot be parsed (callers fall back to their estimate).
@@ -251,7 +265,10 @@ export const ERRORS = {
   EVAL_DISABLED: 'EVAL_DISABLED',
   EVAL_ERROR: 'EVAL_ERROR',
   VIEWPORT_APPLY_FAILED: 'VIEWPORT_APPLY_FAILED',
-  SCREENSHOT_TOO_LARGE: 'SCREENSHOT_TOO_LARGE'
+  SCREENSHOT_TOO_LARGE: 'SCREENSHOT_TOO_LARGE',
+  WEBGL_SHIM_DISABLED: 'WEBGL_SHIM_DISABLED',
+  WEBGL_SHIM_MODE_INVALID: 'WEBGL_SHIM_MODE_INVALID',
+  WEBGL_TRACE_UNAVAILABLE: 'WEBGL_TRACE_UNAVAILABLE'
 };
 
 export const CONFIG = {
@@ -266,5 +283,7 @@ export const CONFIG = {
   MAX_SNAPSHOT_ITEMS,
   MAX_SCREENSHOT_PIXELS,
   MAX_EVAL_LENGTH,
+  MAX_WEBGL_TRACE_LENGTH,
+  MAX_WEBGL_CANVASES,
   QUEUE_LIMIT
 };

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**browser-mcp** is an MCP (Model Context Protocol) server that provides headless Chromium browser automation via raw CDP (Chrome DevTools Protocol). It exposes 14 tools for AI assistants to control a browser instance.
+**browser-mcp** is an MCP (Model Context Protocol) server that provides headless Chromium browser automation via raw CDP (Chrome DevTools Protocol). It exposes 19 tools for AI assistants to control a browser instance — 14 for navigation, reading and interaction, and 5 that compensate for a machine without a usable GPU (`browser_webgl_info`, `browser_canvas_info`, `browser_webgl_shim`, `browser_webgl_trace`, `browser_capture_frames`).
 
 - **Runtime**: Node.js (ESM modules, `"type": "module"`)
 - **Protocol**: MCP over stdio transport
@@ -23,9 +23,10 @@ browser-mcp/
 │   ├── helpers.js              # In-page interaction helpers (callFunctionOn)
 │   ├── keymap.js               # Key resolution for browser_press
 │   ├── lock.js                 # Operation lock (mutex + bounded queue)
-│   ├── utils.js                # Validation, truncation, error formatting, image size decode
-│   └── viewport.js             # Viewport presets + raw resize validation
-├── tests/                      # 22 test files (node:test + node:assert/strict)
+│   ├── utils.js                # Validation, truncation, error formatting, image size decode, capability gates
+│   ├── viewport.js             # Viewport presets + raw resize validation
+│   └── webgl.js                # Static WebGL shim sources, trace expressions, console classification
+├── tests/                      # 23 test files (node:test + node:assert/strict)
 │   ├── harness.js              # Shared harness (fixture server, MCP child, buffered JSON-RPC)
 │   ├── utils.test.js           # Validation, truncation, limits, image-size decode, eval gate
 │   ├── viewport.test.js        # Presets + raw resize-argument validation
@@ -69,7 +70,7 @@ browser-mcp/
 
 **Responsibilities**:
 - Creates MCP server instance with stdio transport
-- Registers 14 tools: `browser_navigate`, `browser_get_url`, `browser_get_text`, `browser_screenshot`, `browser_get_console`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_wait_for`, `browser_scroll`, `browser_resize`, `browser_evaluate`, `browser_hover`, `browser_press`
+- Registers 19 tools: `browser_navigate`, `browser_get_url`, `browser_get_text`, `browser_screenshot`, `browser_get_console`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_wait_for`, `browser_scroll`, `browser_resize`, `browser_evaluate`, `browser_hover`, `browser_press`, `browser_webgl_info`, `browser_canvas_info`, `browser_webgl_shim`, `browser_webgl_trace`, `browser_capture_frames`
 - Manages browser lifecycle (lazy initialization on first tool call)
 - Implements idle timeout shutdown (default 5 minutes)
 - Serializes state-changing operations (click/type/navigate/full-page screenshot) via `src/lock.js`
@@ -414,6 +415,9 @@ MCP Response (JSON-RPC)
 | `MAX_SCREENSHOT_PIXELS` | `16000000` | Screenshot area cap |
 | `MAX_EVAL_LENGTH` | `100000` | browser_evaluate expression/result length cap |
 | `ENABLE_EVAL_JS` | `0` | Enable the browser_evaluate tool (disabled by default) |
+| `MAX_WEBGL_TRACE_LENGTH` | `100000` | browser_webgl_trace response length cap |
+| `MAX_WEBGL_CANVASES` | `50` | Canvases described per browser_canvas_info call (hard cap 200) |
+| `ENABLE_WEBGL_SHIM` | `0` | Enable the browser_webgl_shim tool (disabled by default) |
 | `QUEUE_LIMIT` | `8` | Operation lock queue size |
 
 See `.env.example` for the full documented list (including reserved variables). Priority: tool argument → env var → default → hard limit.
@@ -528,13 +532,53 @@ See `.env.example` for the full documented list (including reserved variables). 
 - **CDP Commands**: `Runtime.evaluate`
 - **Behavior**: reads `window.location.href`, `document.title` and `document.readyState`. This is how a caller asks where the page currently is — after a click that navigated, or after a same-document (hash) navigation. Read-only, never locked, and it reports `about:blank` after a crash restart (see the `sessionReset` signal)
 
+### 15. `browser_webgl_info`
+- **Input**: none
+- **Output**: `{ usable, effective, webgl, webgl2, offscreen, interfaces, shim, reason?, advice?, consoleHits? }`
+- **CDP Commands**: `Runtime.callFunctionOn` (`IN_PAGE.webglInfo`)
+- **Behavior**: creates a throwaway canvas per context type, reports the driver strings and limits when a context is obtained, and releases it with `WEBGL_lose_context`. `effective` answers the real question: `real` (a real context), `shimmed` (supplied by `browser_webgl_shim`), `unavailable`. `usable` is true only for `real`. WebGL-looking console errors already in the buffer are classified by library (three.js, Babylon.js, PixiJS, Mapbox/MapLibre, PlayCanvas)
+- **Locked**: no
+- **Security**: runs a fixed expression, never user input; not gated (diagnosis is not a privileged act)
+
+### 16. `browser_canvas_info`
+- **Input**: `max_canvases` (optional, default `MAX_WEBGL_CANVASES` = 50, hard cap 200)
+- **Output**: `{ count, blank, sampled, truncated, canvases[] }`
+- **CDP Commands**: `Runtime.callFunctionOn` (`IN_PAGE.canvasInfo`)
+- **Behavior**: per canvas — attribute vs. CSS size, viewport position, `mockContextType`, `dataUrlLength`, and a pixel sample (drawn into an offscreen 2D canvas at ≤64×64) giving `uniqueColors`, `nonTransparentRatio` and `blank`. Each entry carries a plain-language `verdict`; a shim-served canvas is reported as blank *on purpose* rather than broken
+- **Locked**: no
+
+### 17. `browser_webgl_shim`
+- **Input**: `mode` (`off` | `mock` | `trace`), `reload` (default true), `timeout_ms`
+- **Output**: `{ mode, identifier, shimmed, appliesTo, reloadRequired, reloaded, note? }`
+- **CDP Commands**: `Page.addScriptToEvaluateOnNewDocument`, `Page.removeScriptToEvaluateOnNewDocument`, `Page.reload` + `Page.loadEventFired`
+- **Behavior**: registers a static shim source that runs before page scripts on subsequent documents, then reloads by default (the current document is unaffected). A real context is always preferred; the mock is the fallback. Modes replace rather than stack. The registration is stored on `Browser.webglShim` and re-applied by `_reapplyWebglShim()` in `_connectToPage()` — the same lifecycle as the viewport override
+- **Errors**: `WEBGL_SHIM_DISABLED` (gate off), `WEBGL_SHIM_MODE_INVALID`
+- **Locked**: yes
+- **Security**: gated behind `ENABLE_WEBGL_SHIM`; source is static text from `src/webgl.js`; every result carries `shimmed: true`
+
+### 18. `browser_webgl_trace`
+- **Input**: `clear` (optional, default false)
+- **Output**: `{ available, installed, mode, stats, recordCount, counts, shaders, draws, uniforms, textures, other, note?, cleared? }`
+- **CDP Commands**: `Runtime.evaluate` (`TRACE_SUMMARY_EXPRESSION`, `TRACE_CLEAR_EXPRESSION`)
+- **Behavior**: summarises the shim's bounded recorder (400 records) in-page and returns capped lists (≤8 shaders, ≤60 draws, ≤40 uniforms, ≤20 textures). `clear` empties the record after reporting it
+- **Errors**: `WEBGL_TRACE_UNAVAILABLE` when no shim is installed
+- **Locked**: no
+
+### 19. `browser_capture_frames`
+- **Input**: `count` (1–60, default 4), `interval_ms` (0–5000, default 200), `format`, `quality`, `strategy` (`screencast`|`poll`), `pump` (`screenshot`|`none`), `selector`, `filename_prefix`, `timeout_ms`
+- **Output**: `{ strategy, requested, captured, format, frames[], elapsed_ms, pump?, pumpCount?, clip?, extraCaptured?, shortBy?, note? }`
+- **CDP Commands**: `Page.startScreencast` / `Page.screencastFrame` / `Page.screencastFrameAck` / `Page.stopScreencast`, or `Page.captureScreenshot`
+- **Behavior**: the screencast is driven by an explicit frame pump because headless Chromium 150 has no `HeadlessExperimental.beginFrame` and no vsync source (a bare screencast measured 1 frame in 6 s on an idle page). The stream is trimmed to `count` and surplus reported as `extraCaptured`; a short capture returns `shortBy` + `note`. Frame dimensions are decoded from the real image header
+- **Errors**: `UNSAFE_PATH`, `SCREENSHOT_TOO_LARGE` (per-frame byte cap), `ELEMENT_HIDDEN`, `ELEMENT_NOT_FOUND`
+- **Locked**: yes
+
 ---
 
 ## Testing Strategy
 
 - **Unit tests**: `node --test tests/*.test.js`
-- **Integration tests**: `integration.test.js`, `interaction.test.js`, `reading-tools.test.js`, `resize.test.js`, `evaluate.test.js`, `hover-press.test.js`, `screenshot-limits.test.js` (spawn real Chromium)
-- **Test fixture**: `fixtures/test-page.html`, `fixtures/page2.html`, `fixtures/lazy-page.html`, `fixtures/tall-page.html`, `fixtures/rtl-page.html`; shared integration harness in `tests/harness.js`
+- **Integration tests**: `integration.test.js`, `interaction.test.js`, `reading-tools.test.js`, `resize.test.js`, `evaluate.test.js`, `hover-press.test.js`, `screenshot-limits.test.js`, `webgl.test.js` (spawn real Chromium)
+- **Test fixture**: `fixtures/test-page.html`, `fixtures/page2.html`, `fixtures/lazy-page.html`, `fixtures/tall-page.html`, `fixtures/rtl-page.html`, `fixtures/webgl-page.html`; shared integration harness in `tests/harness.js` (which strips `ENABLE_EVAL_JS` / `ENABLE_WEBGL_SHIM` from the inherited environment so the disabled default is what gets tested)
 
 **Test Coverage**:
 - URL validation (scheme, private IP, edge cases)
@@ -552,6 +596,7 @@ See `.env.example` for the full documented list (including reserved variables). 
 - Hover and key press (Enter form submit, Tab focus, Escape, modifiers, unsupported keys)
 - Screenshot limits (post-capture downscaling, mobile page scale, tall pages)
 - Full-page completeness (lazy rendering, >16M downscale-not-crop, RTL page not distorted)
+- WebGL (availability + console classification, canvas blankness vs. a drawn control, shim install/boot/remove and its `ENABLE_WEBGL_SHIM` gate, trace contents and `clear`, frame capture via screencast and poll)
 - Operation lock (FIFO, queue limit, release on error/timeout)
 - Security (selector/text injection resistance, no sensitive logging)
 
@@ -577,7 +622,8 @@ See `.env.example` for the full documented list (including reserved variables). 
 3. **Output Isolation**: Screenshots confined to `OUTPUT_DIR`
 4. **Resource Limits**: Timeouts, text truncation, pixel limits
 5. **Gated JS execution**: no arbitrary-JS tool runs by default — `browser_evaluate` is refused (`EVAL_DISABLED`) unless `ENABLE_EVAL_JS=1`. When enabled it can read cookies/localStorage and reach internal networks via in-page `fetch()` (SSRF), bypassing the navigation-only `validateURL` check. No other tool executes user-supplied JavaScript.
-6. **Measured screenshot limits**: after each capture the real image dimensions are decoded from the buffer and the byte size checked; oversized captures are downscaled via `clip.scale` (never cropped) and re-captured once, or fail with `SCREENSHOT_TOO_LARGE`.
+6. **Gated WebGL shim**: `browser_webgl_shim` is refused (`WEBGL_SHIM_DISABLED`) unless `ENABLE_WEBGL_SHIM=1`. It injects a fixed script into every document the browser loads, making a page report a rendering capability it does not have — so a caller can never take canvas content as proof the app works. The injected source is static text (`src/webgl.js`), composed from two constants rather than interpolated, and every result is marked `shimmed: true`. The read-only probes (`browser_webgl_info`, `browser_canvas_info`) are not gated: they run fixed expressions and return numbers, not code execution.
+7. **Measured screenshot limits**: after each capture the real image dimensions are decoded from the buffer and the byte size checked; oversized captures are downscaled via `clip.scale` (never cropped) and re-captured once, or fail with `SCREENSHOT_TOO_LARGE`.
 
 ---
 

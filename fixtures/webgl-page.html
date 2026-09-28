@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGL Fixture</title>
+  <style>
+    html, body { margin: 0; padding: 16px; font-family: system-ui, sans-serif; background: #101418; color: #e6edf3; }
+    h1 { font-size: 18px; margin: 0 0 12px; }
+    canvas { border: 1px solid #2b3a45; display: block; margin: 8px 0; background: #0b0f13; }
+    #status { padding: 8px 12px; border-radius: 6px; background: #1c2530; margin-bottom: 12px; display: inline-block; }
+    #status.ok { background: #123524; color: #7ee2a8; }
+    #status.bad { background: #3a1d1d; color: #ff9b9b; }
+    /* Kept above the fold: a moving element below the viewport does not show up
+       in frame captures, which makes correct captures look like frozen ones. */
+    #track { position: relative; height: 48px; background: #1c2530; border-radius: 6px; overflow: hidden; }
+    #mover { position: absolute; top: 8px; left: 0; width: 64px; height: 32px; border-radius: 4px; background: #4a9eff; }
+    p { color: #9fb0c0; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>WebGL Fixture</h1>
+  <div id="status">pending</div>
+
+  <p>DOM animation (#mover) — gives browser_capture_frames something that changes:</p>
+  <div id="track"><div id="mover"></div></div>
+
+  <p>Canvas2D control (#canvas2d) — proves the capture path itself works:</p>
+  <canvas id="canvas2d" width="200" height="100"></canvas>
+
+  <p>WebGL canvas (#gl) — the element that cannot render in this environment:</p>
+  <canvas id="gl" width="320" height="200"></canvas>
+
+  <script>
+    // --- 2D control canvas: drawn for real, no GPU involved ---
+    (function () {
+      var ctx = document.getElementById('canvas2d').getContext('2d');
+      ctx.fillStyle = '#0a7d5a';
+      ctx.fillRect(0, 0, 200, 100);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(20, 20, 60, 60);
+      ctx.fillStyle = '#ffd166';
+      ctx.fillRect(110, 35, 70, 30);
+    })();
+
+    // --- DOM animation: runs whether or not WebGL works ---
+    (function () {
+      var mover = document.getElementById('mover');
+      var track = document.getElementById('track');
+      var x = 0;
+      setInterval(function () {
+        var max = Math.max(0, track.clientWidth - mover.clientWidth);
+        x = (x + 24) % (max + 1);
+        mover.style.left = x + 'px';
+      }, 120);
+    })();
+
+    // --- WebGL canvas: the subject of the fixture ---
+    (function () {
+      var statusEl = document.getElementById('status');
+      var canvas = document.getElementById('gl');
+
+      var gl = null;
+      try {
+        gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+      } catch (e) {
+        gl = null;
+      }
+
+      window.__webglStatus = gl ? 'available' : 'unavailable';
+
+      if (!gl) {
+        // The wording three.js emits when its renderer cannot start, so the
+        // console classifier in browser_webgl_info has a real signature to match.
+        console.error('Error creating WebGL context.');
+        statusEl.textContent = 'WebGL unavailable';
+        statusEl.className = 'bad';
+        return;
+      }
+
+      // Minimal scene: one triangle, one shader pair. With the lab shim in
+      // place this runs against the mock and every call is recorded, which is
+      // what browser_webgl_trace reads back.
+      var VERTEX_SOURCE = 'attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }';
+      var FRAGMENT_SOURCE = 'precision mediump float; uniform vec3 uColor; void main() { gl_FragColor = vec4(uColor, 1.0); }';
+
+      var program = gl.createProgram();
+
+      var vertex = gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(vertex, VERTEX_SOURCE);
+      gl.compileShader(vertex);
+      gl.attachShader(program, vertex);
+
+      var fragment = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fragment, FRAGMENT_SOURCE);
+      gl.compileShader(fragment);
+      gl.attachShader(program, fragment);
+
+      gl.linkProgram(program);
+      gl.useProgram(program);
+
+      var buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.6, -0.5, 0.6, -0.5, 0.0, 0.6]), gl.STATIC_DRAW);
+
+      var position = gl.getAttribLocation(program, 'p');
+      gl.enableVertexAttribArray(position);
+      gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+
+      var color = gl.getUniformLocation(program, 'uColor');
+
+      var t = 0;
+      function render() {
+        t += 0.02;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0.05, 0.07, 0.1, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        if (color) gl.uniform3f(color, 0.5 + 0.5 * Math.sin(t), 0.65, 0.95);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        requestAnimationFrame(render);
+      }
+      render();
+
+      statusEl.textContent = gl.__mcpMock === true ? 'WebGL available (shim)' : 'WebGL available (hardware)';
+      statusEl.className = 'ok';
+    })();
+  </script>
+</body>
+</html>
